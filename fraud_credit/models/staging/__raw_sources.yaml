@@ -1,0 +1,102 @@
+version: 2
+
+# Camada raw: dados como chegaram do seed, ainda sujos. Os testes aqui sao o
+# "contrato de entrada" — servem para detectar mudanca na origem, nao para
+# barrar o pipeline. Por isso a maioria e severity: warn; a limpeza acontece
+# em int_fraud_credit_cleaned e e la que os testes viram error.
+#
+# Freshness nao esta configurado de proposito: a origem e um seed estatico
+# (transacoes de 2020-01 a 2024-01), entao qualquer threshold de freshness
+# ficaria permanentemente vermelho. Quando a origem virar ingestao real,
+# adicione loaded_at_field + freshness aqui.
+
+sources:
+  - name: raw
+    description: Banco raw com dados do fraud_credit
+    database: postgres
+    schema: postgres
+    tables:
+      - name: df_fraud_credit
+        description: >
+          Transacoes cripto com rotulo de risco, carregadas pelo dbt seed.
+          Todas as colunas chegam como texto/numerico bruto, incluindo o
+          sentinela 'none' em amount e risk_score.
+        columns:
+          - name: timestamp
+            description: Unix timestamp da transacao (integer).
+            quote: true
+            data_tests:
+              - not_null:
+                  config:
+                    severity: error
+
+          - name: sending_address
+            description: Carteira de origem.
+            data_tests:
+              - not_null:
+                  config:
+                    severity: error
+
+          - name: receiving_address
+            description: Carteira de destino.
+            data_tests:
+              - not_null:
+                  config:
+                    severity: error
+
+          - name: transaction_type
+            description: Natureza da transacao. phishing e scam sao fraude confirmada.
+            data_tests:
+              - not_null:
+                  config:
+                    severity: error
+              - accepted_values:
+                  arguments:
+                    values: ['sale', 'purchase', 'transfer', 'phishing', 'scam']
+                  config:
+                    severity: warn
+
+          - name: location_region
+            description: >
+              Regiao geografica. ATENCAO: a origem entrega 5.795 linhas com o
+              valor '0' (placeholder de regiao desconhecida). O teste esta
+              como warn para registrar a sujeira sem travar a carga.
+            data_tests:
+              - not_null:
+                  config:
+                    severity: error
+              - accepted_values:
+                  arguments:
+                    values: ['Europe', 'South America', 'Asia', 'Africa', 'North America']
+                  config:
+                    severity: warn
+
+          - name: purchase_pattern
+            data_tests:
+              - accepted_values:
+                  arguments:
+                    values: ['focused', 'high_value', 'random']
+                  config:
+                    severity: warn
+
+          - name: age_group
+            data_tests:
+              - accepted_values:
+                  arguments:
+                    values: ['established', 'veteran', 'new']
+                  config:
+                    severity: warn
+
+          - name: login_frequency
+            description: Numero de logins na sessao. Esperado entre 1 e 8.
+            data_tests:
+              - not_null:
+                  config:
+                    severity: error
+
+          - name: session_duration
+            description: Duracao da sessao em minutos.
+            data_tests:
+              - not_null:
+                  config:
+                    severity: error

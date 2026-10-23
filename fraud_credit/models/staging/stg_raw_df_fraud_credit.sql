@@ -1,0 +1,1 @@
+ select * from {{source('raw','df_fraud_credit')}}

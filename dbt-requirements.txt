@@ -1,0 +1,6 @@
+# >=1.10 e obrigatorio: os testes do projeto usam a sintaxe "arguments:" para
+# passar parametros a testes genericos, introduzida no dbt 1.10. Sem o pin, uma
+# reconstrucao da imagem poderia cair numa versao antiga e quebrar o parse.
+dbt-postgres>=1.10,<2.0
+#elementary-data==0.19.4
+astronomer-cosmos

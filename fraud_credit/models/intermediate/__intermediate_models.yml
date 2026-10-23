@@ -1,0 +1,492 @@
+version: 2
+
+# Camada intermediaria: e AQUI que o data quality tem mais valor.
+#
+# 1. E o primeiro ponto onde os tipos ja estao corretos (transaction_at e um
+#    timestamp de verdade, amount e numeric), entao da pra testar faixa e nulo.
+# 2. E o unico model com uma coluna de tempo utilizavel espalhada por 4 anos
+#    (2020-01 a 2024-01). Isso da ao Elementary uma serie historica real para
+#    fazer deteccao de anomalia por bucket diario — sem precisar esperar
+#    semanas de execucoes acumularem.
+#
+# Por isso a materializacao passou de ephemeral para view em dbt_project.yml:
+# model ephemeral nao existe no banco, logo o Elementary nao consegue medir
+# volume, distribuicao nem schema dele.
+#
+# ---------------------------------------------------------------------------
+# A JANELA DE DETECCAO E O PONTO CRITICO DESTE DATASET
+# ---------------------------------------------------------------------------
+# O Elementary calcula a janela assim (get_buckets_configuration.sql):
+#
+#   detection_end    = run_started_at - detection_delay
+#   min_bucket_start = detection_end - training_period
+#   detection_period = quanto da ponta mais nova pode ser acusada
+#
+# Tudo ancorado em run_started_at, ou seja em HOJE. Com os defaults
+# (training_period 14 dias, detection_period 2 dias) e um dataset que termina
+# em 2024-01-02, a janela caia inteira em territorio vazio: os 14 buckets
+# tinham metric_value = 0, variancia zero, nenhuma anomalia possivel. Os
+# testes passavam VERDES sem medir nada — confirmado em
+# postgres_elementary.data_monitoring_metrics.
+#
+# O detection_delay resolve: empurra detection_end para tras ate a ponta do
+# dado. 993 = dias entre o ultimo transaction_at (2024-01-02) e 2026-09-21.
+#
+# ATENCAO A DERIVA: o delay e um numero fixo, entao detection_end anda 1 dia
+# para tras por dia de calendario. A janela continua sobre dado real por anos
+# (o dataset tem 4 anos de historico), mas para recalcular o valor exato:
+#
+#   select (now()::date - max(transaction_at)::date)
+#   from postgres.int_fraud_credit_cleaned;
+#
+# O fail_on_zero: true e a rede de seguranca — se a janela um dia sair do
+# dado, o teste FALHA em vez de passar cego, que era o problema original.
+
+models:
+  - name: int_fraud_credit_cleaned
+    description: >
+      Transacoes com tipos normalizados: epoch -> timestamp, amount e
+      risk_score com o sentinela 'none' convertido em NULL.
+    config:
+      elementary:
+        # Coluna de tempo padrao para todos os testes Elementary deste model.
+        timestamp_column: transaction_at
+
+        # Janela herdada por TODOS os testes Elementary deste model.
+        # A ordem de resolucao do Elementary e: argumento explicito no teste >
+        # este bloco > vars global do dbt_project.yml (get_test_argument.sql).
+        detection_delay:
+          period: day
+          count: 993
+        training_period:
+          period: day
+          count: 180
+        detection_period:
+          period: day
+          count: 7
+
+    data_tests:
+      - elementary.schema_changes:
+          config:
+            tags: ["elementary", "dq"]
+            store_failures: false
+            severity: warn
+
+      # ---------------------------------------------------------------
+      # VOLUME
+      # ---------------------------------------------------------------
+
+      # Contagem de linhas por dia de transacao. Queda ou pico fora do padrao
+      # historico vira anomalia.
+      #
+      # seasonality: day_of_week compara segunda com segunda, domingo com
+      # domingo. Custo: o Elementary multiplica o training_period por 7
+      # internamente (get_days_back.sql), entao 180 dias viram 1260 dias de
+      # janela — ainda dentro do dado, que comeca em 2020-01-01.
+      - elementary.volume_anomalies:
+          name: volume_anomalies_diario
+          arguments:
+            timestamp_column: transaction_at
+            time_bucket:
+              period: day
+              count: 1
+            seasonality: day_of_week
+            fail_on_zero: true
+          config:
+            tags: ["elementary", "dq"]
+            store_failures: false
+            severity: warn
+
+      # O teste com significado de NEGOCIO: volume de fraude confirmada.
+      # where_expression restringe a medicao, anomaly_direction: spike ignora
+      # queda — fraude caindo e boa noticia, nao incidente.
+      - elementary.volume_anomalies:
+          name: volume_anomalies_fraude_spike
+          arguments:
+            timestamp_column: transaction_at
+            where_expression: "transaction_type in ('phishing', 'scam')"
+            anomaly_direction: spike
+            time_bucket:
+              period: day
+              count: 1
+            fail_on_zero: true
+          config:
+            tags: ["elementary", "dq", "fraude"]
+            store_failures: false
+            severity: warn
+
+      # Alternativa NAO estatistica ao volume_anomalies: em vez de z-score
+      # sobre a serie historica, compara bucket contra bucket por percentual.
+      # Util quando o volume nao tem distribuicao estavel o suficiente para
+      # z-score, e da dois niveis de severidade num unico teste.
+      - elementary.volume_threshold:
+          name: volume_threshold_diario
+          arguments:
+            timestamp_column: transaction_at
+            warn_threshold_percent: 15
+            error_threshold_percent: 40
+            direction: both
+            time_bucket:
+              period: day
+              count: 1
+          config:
+            tags: ["elementary", "dq"]
+            store_failures: false
+            severity: warn
+
+      # ---------------------------------------------------------------
+      # FRESHNESS
+      # ---------------------------------------------------------------
+
+      # Mede o maior INTERVALO entre transacoes consecutivas dentro de cada
+      # bucket. Nao e o mesmo que volume: o dia pode ter a contagem normal e
+      # ainda assim ter um buraco de 8 horas sem nenhuma transacao — sinal
+      # classico de coleta interrompida.
+      #
+      # anomaly_direction fica no default do teste (spike): so alerta quando o
+      # intervalo CRESCE, porque intervalo menor significa dado mais denso.
+      - elementary.freshness_anomalies:
+          name: freshness_anomalies_transacao
+          arguments:
+            timestamp_column: transaction_at
+            time_bucket:
+              period: day
+              count: 1
+          config:
+            tags: ["elementary", "dq"]
+            store_failures: false
+            severity: warn
+
+      # ---------------------------------------------------------------
+      # DIMENSOES
+      # ---------------------------------------------------------------
+
+      # Volume por categoria: pega o caso em que o total se mantem mas a
+      # composicao muda (ex.: phishing/scam disparando).
+      - elementary.dimension_anomalies:
+          name: dimension_anomalies_tipo_regiao
+          arguments:
+            timestamp_column: transaction_at
+            dimensions:
+              - transaction_type
+              - location_region
+          config:
+            tags: ["elementary", "dq"]
+            store_failures: false
+            severity: warn
+
+      # Dimensoes comportamentais, ainda nao vigiadas. As duas estao
+      # equilibradas na origem (~348k linhas em cada um dos 3 valores), entao
+      # a distribuicao e uma baseline limpa: desequilibrio aqui indica que o
+      # perfil da base de usuarios mudou.
+      #
+      # dimensions aceita EXPRESSAO SQL, nao so nome de coluna — a terceira
+      # entrada cruza as duas para pegar mudanca na combinacao que nenhuma
+      # das duas isoladas mostraria (3 x 3 = 9 perfis).
+      #
+      # chr(47) e a barra '/'. Parece rebuscado e e proposital: o Elementary
+      # monta o rotulo da dimensao concatenando esta lista dentro de um
+      # literal SQL e NAO escapa aspas simples. Escrever '/' aqui fecha o
+      # literal no meio e o Postgres passa a ler a barra como divisao:
+      #   operator is not unique: unknown / unknown
+      # chr(47) entrega o mesmo caractere sem introduzir aspas na expressao.
+      - elementary.dimension_anomalies:
+          name: dimension_anomalies_perfil_usuario
+          arguments:
+            timestamp_column: transaction_at
+            dimensions:
+              - age_group
+              - purchase_pattern
+              - "age_group || chr(47) || purchase_pattern"
+          config:
+            tags: ["elementary", "dq"]
+            store_failures: false
+            severity: warn
+
+      # ---------------------------------------------------------------
+      # TODAS AS COLUNAS, AUTOMATICO
+      # ---------------------------------------------------------------
+
+      # all_columns_anomalies escolhe as metricas pelo TIPO de cada coluna,
+      # sem precisar declarar coluna por coluna:
+      #   - toda coluna:  null_count, null_percent
+      #   - texto:        min_length, max_length, average_length,
+      #                   missing_count, missing_percent
+      #   - numerica:     min, max, average, zero_count, zero_percent,
+      #                   standard_deviation, variance
+      #
+      # E a rede de arrasto: cobre as colunas que ninguem pensou em testar.
+      # Os column_anomalies explicitos mais abaixo continuam, com metricas
+      # escolhidas a mao onde a coluna merece atencao especifica.
+      #
+      # exclude_regexp tira as duas carteiras: elas tem 1.048.575 valores
+      # praticamente unicos, entao min/max/average de TEXTO nao dizem nada.
+      # O que importa nelas e o COMPRIMENTO, testado explicitamente abaixo.
+      - elementary.all_columns_anomalies:
+          name: all_columns_anomalies_cobertura
+          arguments:
+            timestamp_column: transaction_at
+            exclude_regexp: ".*_address$"
+          config:
+            tags: ["elementary", "dq"]
+            store_failures: false
+            severity: warn
+
+      # ---------------------------------------------------------------
+      # COLETA DE METRICAS (nao e teste de alerta)
+      # ---------------------------------------------------------------
+
+      # collect_metrics nao acusa nada: ele apenas CALCULA metricas e as grava
+      # em data_monitoring_metrics com historico, para aparecerem no relatorio
+      # do Elementary. O proprio macro se marca com
+      # meta.elementary.include = false, entao nunca entra como falha.
+      #
+      # Serve para levar ao relatorio os indicadores do requisito de qualidade
+      # — percentual de conformidade — como SERIE TEMPORAL por dia, e nao
+      # apenas como o retrato unico que o mart_dq_indicadores produz.
+      # not_null_percent e not_missing_percent sao nativos do Elementary: nao
+      # precisam do SQL do mart para existir.
+      #
+      # ATENCAO A UMA ASSIMETRIA DA API: collect_metrics NAO aceita
+      # detection_delay (conferir a assinatura em test_collect_metrics.sql),
+      # so days_back — a janela e sempre [agora - days_back, agora]. Por isso
+      # 1100 aqui, e nao os 180 do bloco config.elementary acima: e o minimo
+      # para a janela alcancar 2024-01-02. Os buckets de 2024-01 ate hoje vem
+      # zerados, e aqui isso e inofensivo, porque este teste nao alerta.
+      - elementary.collect_metrics:
+          name: collect_metrics_conformidade
+          arguments:
+            timestamp_column: transaction_at
+            days_back: 1100
+            time_bucket:
+              period: day
+              count: 1
+            metrics:
+              - name: pct_nao_nulo_amount
+                type: not_null_percent
+                columns: amount
+              - name: pct_nao_nulo_risk_score
+                type: not_null_percent
+                columns: risk_score
+              - name: pct_nao_vazio_location_region
+                type: not_missing_percent
+                columns: location_region
+          config:
+            tags: ["elementary", "dq"]
+
+    columns:
+      - name: transaction_at
+        description: Momento da transacao (epoch convertido para timestamp).
+        data_tests:
+          - not_null
+
+      - name: sending_address
+        description: >
+          Carteira de origem. Formato verificado na base inteira: 42
+          caracteres, sempre '0x' + 40 hex minusculos, zero violacoes em
+          1.048.575 linhas.
+        data_tests:
+          - not_null
+
+          # Contrato de formato. A variante _with_context do Elementary faz o
+          # mesmo que o teste comum, mas grava as colunas de contexto junto
+          # com a linha que falhou — a diferenca entre "42 linhas invalidas" e
+          # "estas 42 linhas, com data e tipo, para investigar".
+          - elementary.expect_column_values_to_match_regex_with_context:
+              name: formato_sending_address
+              arguments:
+                regex: "^0x[0-9a-f]{40}$"
+                context_columns:
+                  - transaction_at
+                  - transaction_type
+                  - location_region
+              config:
+                tags: ["dq"]
+                severity: warn
+
+          # Comprimento como sensor de endereco malformado: se average_length
+          # sair de 42, algum endereco veio truncado ou com sufixo colado —
+          # exatamente a classe de defeito do 'anomaly;;;' da origem.
+          - elementary.column_anomalies:
+              name: column_anomalies_sending_address_len
+              arguments:
+                column_anomalies:
+                  - min_length
+                  - max_length
+                  - average_length
+                  - missing_count
+                timestamp_column: transaction_at
+              config:
+                tags: ["elementary", "dq"]
+                store_failures: false
+                severity: warn
+
+      - name: receiving_address
+        description: Carteira de destino. Mesmo contrato de formato da origem.
+        data_tests:
+          - not_null
+          - elementary.expect_column_values_to_match_regex_with_context:
+              name: formato_receiving_address
+              arguments:
+                regex: "^0x[0-9a-f]{40}$"
+                context_columns:
+                  - transaction_at
+                  - transaction_type
+                  - amount
+              config:
+                tags: ["dq"]
+                severity: warn
+
+          - elementary.column_anomalies:
+              name: column_anomalies_receiving_address_len
+              arguments:
+                column_anomalies:
+                  - min_length
+                  - max_length
+                  - average_length
+                  - missing_count
+                timestamp_column: transaction_at
+              config:
+                tags: ["elementary", "dq"]
+                store_failures: false
+                severity: warn
+
+      - name: amount
+        description: >
+          Valor da transacao. 5.641 linhas vem com 'none' na origem e viram NULL
+          aqui — por isso not_null e warn, nao error.
+        data_tests:
+          - not_null:
+              config:
+                severity: warn
+
+          # accepted_range_with_context em lugar do dbt_utils: mesma
+          # verificacao de faixa, mas a linha que falha vem com contexto.
+          - elementary.accepted_range_with_context:
+              name: faixa_amount
+              arguments:
+                min_value: 0
+                inclusive: true
+                context_columns:
+                  - transaction_at
+                  - sending_address
+                  - transaction_type
+              config:
+                severity: error
+
+          # Metricas ampliadas. As quatro originais (null_count, min, max,
+          # average) medem nivel; as novas medem DISPERSAO e concentracao:
+          #   standard_deviation / variance -> a cauda de valores altos mudou
+          #   zero_count                    -> transacao de valor zero
+          #   sum                            -> volume financeiro do dia
+          # sum e opt-in no Elementary, nao entra por default em lugar nenhum.
+          - elementary.column_anomalies:
+              arguments:
+                column_anomalies:
+                  - null_count
+                  - min
+                  - max
+                  - average
+                  - standard_deviation
+                  - variance
+                  - zero_count
+                  - sum
+                timestamp_column: transaction_at
+              config:
+                tags: ["elementary", "dq"]
+                store_failures: false
+                severity: warn
+
+      - name: risk_score
+        description: >
+          Score de risco de 0 a 100. 5.695 linhas vem com 'none' na origem e
+          viram NULL aqui.
+        data_tests:
+          - not_null:
+              config:
+                severity: warn
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 100
+                inclusive: true
+              config:
+                severity: error
+
+          # standard_deviation aqui e o sensor mais interessante do model: o
+          # risk_score e limitado a 0-100, entao min/max quase nao se movem.
+          # Se a distribuicao inteira deslizar (mais gente em risco alto), e o
+          # desvio-padrao e a media que acusam, nao os extremos.
+          - elementary.column_anomalies:
+              arguments:
+                column_anomalies:
+                  - null_count
+                  - null_percent
+                  - min
+                  - max
+                  - average
+                  - standard_deviation
+                  - variance
+                timestamp_column: transaction_at
+              config:
+                tags: ["elementary", "dq"]
+                store_failures: false
+                severity: warn
+
+      - name: login_frequency
+        description: "Logins na sessao. Faixa observada na origem: 1 a 8."
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                max_value: 8
+                inclusive: true
+              config:
+                severity: warn
+
+      - name: session_duration
+        description: "Duracao da sessao em minutos. Faixa observada: 20 a 159."
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+              config:
+                severity: error
+
+      - name: anomaly_status
+        description: >
+          Rotulo de risco vindo da coluna "anomaly" da origem, com o sufixo
+          ';;;' removido pelo replace() do model. O teste e error: depois da
+          limpeza, um valor fora do dominio significa que a origem mudou ou
+          que a limpeza parou de funcionar — nos dois casos e incidente, nao
+          sujeira esperada. A sujeira original continua medida na camada raw,
+          pelo teste da source e pelo mart_dq_indicadores.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['low_risk', 'moderate_risk', 'high_risk']
+              config:
+                severity: error
+
+      - name: location_region
+        description: >
+          Regiao geografica. O placeholder '0' da origem (5.795 linhas) e
+          normalizado para 'unknown' aqui — a linha continua contavel nos
+          indicadores de qualidade, e os marts de resultado a excluem por
+          nao ser uma regiao. Se um valor novo aparecer fora desta lista, a
+          origem mudou.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['Europe', 'South America', 'Asia', 'Africa', 'North America', 'unknown']
+              config:
+                severity: error
+
+      - name: transaction_type
+        data_tests:
+          - not_null

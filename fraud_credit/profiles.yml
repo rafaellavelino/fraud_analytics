@@ -1,0 +1,29 @@
+# Host padrao = "dbt-postgres": servico definido em docker-compose.override.yml.
+# Rodando fora do container, exporte ELEMENTARY_DB_HOST=localhost e ELEMENTARY_DB_PORT=5433.
+fraud_credit:
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('ELEMENTARY_DB_HOST', 'dbt-postgres') }}"
+      port: "{{ env_var('ELEMENTARY_DB_PORT', '5432') | int }}"
+      user: "{{ env_var('ELEMENTARY_DB_USER', 'postgres') }}"
+      pass: "{{ env_var('ELEMENTARY_DB_PASSWORD', 'postgres') }}"
+      dbname: "{{ env_var('ELEMENTARY_DB_NAME', 'postgres') }}"
+      schema: "{{ env_var('ELEMENTARY_DB_SCHEMA', 'postgres') }}"
+      threads: 4
+  target: dev
+
+# Profile usado pelo edr (Elementary CLI). Aponta para o schema onde o pacote
+# elementary materializa suas tabelas: <schema do dbt>_elementary.
+elementary:
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('ELEMENTARY_DB_HOST', 'dbt-postgres') }}"
+      port: "{{ env_var('ELEMENTARY_DB_PORT', '5432') | int }}"
+      user: "{{ env_var('ELEMENTARY_DB_USER', 'postgres') }}"
+      pass: "{{ env_var('ELEMENTARY_DB_PASSWORD', 'postgres') }}"
+      dbname: "{{ env_var('ELEMENTARY_DB_NAME', 'postgres') }}"
+      schema: "{{ env_var('ELEMENTARY_DB_SCHEMA', 'postgres') }}_elementary"
+      threads: 4
+  target: dev

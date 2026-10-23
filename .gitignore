@@ -1,0 +1,29 @@
+raud_credit/
+.venv
+.git
+.env
+.DS_Store
+__pycache__/
+astro
+.venv
+.astro/standalone/
+.astro/worktrees/
+airflow-webserver.pid
+webserver_config.py
+airflow.cfg
+airflow.db
+.astro/*.local.yml
+.astro/*.local.yaml
+
+**/.astro/dbt_metadata.json
+**/.astro/manifest.slim.json
+.astro
+
+# Saida do Elementary
+include/elementary/*.html
+edr_target/
+**/edr_target/
+
+# CSV bruto de ingestao: 167MB, acima do limite de 100MB do GitHub.
+# Vive em include/data/ (bind-mount do astro dev), fora da imagem Docker.
+include/data/*.csv

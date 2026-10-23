@@ -1,0 +1,135 @@
+version: 2
+
+# Staging: passthrough da source (select *). Nao ha logica aqui, entao o unico
+# risco real e a ORIGEM MUDAR DE FORMA — coluna somem, aparecem ou trocam de
+# tipo. E exatamente isso que elementary.schema_changes vigia.
+#
+# Os testes de CONTEUDO ficam em __raw_sources.yaml (um nivel acima) para nao
+# duplicar a mesma verificacao em duas camadas.
+
+models:
+  - name: stg_raw_df_fraud_credit
+    description: >
+      View 1:1 sobre raw.df_fraud_credit. Preserva os tipos e a sujeira da
+      origem de proposito; a limpeza acontece em int_fraud_credit_cleaned.
+    data_tests:
+      # Alerta se a origem ganhar/perder coluna ou mudar tipo. Nao precisa de
+      # historico para funcionar: compara contra o ultimo schema conhecido.
+      - elementary.schema_changes:
+          config:
+            tags: ["elementary", "dq"]
+            store_failures: false
+            severity: warn
+
+      # schema_changes_from_baseline e um teste DIFERENTE do schema_changes,
+      # e para este projeto e o mais importante dos dois.
+      #
+      # schema_changes compara o schema atual contra O ULTIMO SCHEMA VISTO.
+      # Isso significa que ele avisa uma vez e depois aceita a mudanca como o
+      # novo normal — se a origem chegar errada e ficar errada, ele silencia.
+      #
+      # schema_changes_from_baseline compara contra o CONTRATO DECLARADO
+      # abaixo, coluna por coluna, tipo por tipo. Nao ha "novo normal": o
+      # desvio continua sendo reportado em todo run enquanto existir.
+      #
+      # Motivo concreto de existir aqui: o CSV de amostra deste projeto
+      # entregava a ultima coluna com o nome "anomaly;;;" em vez de "anomaly".
+      # Uma tabela criada a partir dele nasce com a coluna errada, e a
+      # ingestao por COPY falha com "column anomaly does not exist" — foi o
+      # incidente real que motivou este teste. O baseline pega isso no run
+      # seguinte, e nao na proxima carga.
+      #
+      # fail_on_added: false — coluna nova na origem e aditiva, nao quebra o
+      # pipeline (os models nomeiam as colunas que usam). Ela ainda aparece no
+      # schema_changes acima como aviso.
+      # enforce_types: true — obriga que todas as colunas abaixo tenham
+      # data_type declarado. Sem isso o Elementary apenas emite um warning e
+      # segue, e o contrato fica meio vazio sem ninguem perceber.
+      - elementary.schema_changes_from_baseline:
+          arguments:
+            fail_on_added: false
+            enforce_types: true
+          config:
+            tags: ["elementary", "dq", "contrato"]
+            store_failures: false
+            severity: warn
+
+      # Sem timestamp_column utilizavel aqui (a origem traz unix epoch como
+      # inteiro), entao o Elementary agrupa por horario de EXECUCAO. So produz
+      # sinal depois de alguns dias de runs — por isso warn.
+      #
+      # Sem detection_delay de proposito: este bucket E o horario de execucao,
+      # que esta sempre em "hoje". O problema de janela vazia que afeta o
+      # int_fraud_credit_cleaned (ver o comentario longo no yml daquela
+      # camada) nao se aplica a um teste ancorado no run.
+      - elementary.volume_anomalies:
+          config:
+            tags: ["elementary", "dq"]
+            store_failures: false
+            severity: warn
+
+    # As 13 colunas abaixo SAO o baseline lido pelo
+    # schema_changes_from_baseline. A ordem do CSV esta preservada de
+    # proposito: e a mesma lista de COLUMNS em dags/fraud_credit_ingest.py,
+    # que faz o COPY casar por posicao. Se as duas listas divergirem, a
+    # ingestao quebra — manter as duas lado a lado facilita a conferencia.
+    columns:
+      - name: timestamp
+        data_type: integer
+        description: Unix timestamp da transacao, ainda como inteiro.
+        quote: true
+
+      - name: sending_address
+        data_type: text
+        description: Carteira de origem.
+
+      - name: receiving_address
+        data_type: text
+        description: Carteira de destino.
+
+      - name: amount
+        data_type: text
+        description: >
+          TEXT de proposito na ingestao: a origem usa o sentinela 'none'
+          nesta coluna, e um cast no COPY abortaria a carga inteira. A
+          conversao para numeric acontece em int_fraud_credit_cleaned.
+
+      - name: transaction_type
+        data_type: text
+        description: Natureza da transacao.
+
+      - name: location_region
+        data_type: text
+        description: Regiao geografica (contem o placeholder '0' na origem).
+
+      - name: ip_prefix
+        data_type: double precision
+        description: Prefixo do IP de origem.
+
+      - name: login_frequency
+        data_type: integer
+        description: Numero de logins na sessao.
+
+      - name: session_duration
+        data_type: integer
+        description: Duracao da sessao em minutos.
+
+      - name: purchase_pattern
+        data_type: text
+        description: Padrao de compra do usuario.
+
+      - name: age_group
+        data_type: text
+        description: Faixa de maturidade da conta.
+
+      - name: risk_score
+        data_type: text
+        description: >
+          TEXT na origem pelo mesmo motivo de amount (sentinela 'none').
+
+      - name: anomaly
+        data_type: text
+        description: >
+          Rotulo de risco. E A COLUNA DO INCIDENTE: o CSV de amostra a
+          entregava como "anomaly;;;". O baseline declarado aqui e o que
+          detecta a reincidencia.

@@ -1,0 +1,46 @@
+# Postgres dedicado ao dbt/Elementary (o data warehouse do projeto).
+#
+# Por que um Postgres separado: o `astro dev` ja sobe um Postgres proprio
+# (servico "postgres", porta 5432 no host) que e o banco de METADADOS do
+# Airflow. Materializar os models do dbt la dentro misturaria as tabelas do
+# projeto com as tabelas internas do Airflow. Este servico e o warehouse.
+#
+# Nome do arquivo importa: o Astro CLI so le "docker-compose.override.yml".
+# Com .yaml o arquivo e silenciosamente ignorado.
+#
+# Host para se conectar:
+#   - de dentro dos containers (Airflow, Cosmos, edr): dbt-postgres:5432
+#   - da sua maquina (DBeaver, dbt local):             localhost:5433
+
+services:
+  dbt-postgres:
+    image: postgres:16
+    # SEM ISTO O AIRFLOW NAO ENXERGA ESTE BANCO. O astro dev cria uma rede
+    # propria chamada "airflow" e so anexa os servicos dele; um servico
+    # declarado no override cai na rede "default" do compose, que e outra —
+    # o resultado e "could not translate host name dbt-postgres".
+    networks:
+      - airflow
+    container_name: dbt-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      # 5433 no host: a 5432 ja e do Postgres de metadados do astro dev.
+      - "5433:5432"
+    volumes:
+      - dbt_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+# Declarada aqui para o Compose reaproveitar a rede que o astro dev ja criou,
+# em vez de tentar criar uma nova.
+networks:
+  airflow:
+
+volumes:
+  dbt_postgres_data:

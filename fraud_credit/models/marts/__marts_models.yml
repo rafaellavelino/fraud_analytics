@@ -1,0 +1,195 @@
+version: 2
+
+# Marts: produto final, consumido por gente. Aqui os testes sao contratos
+# duros (error), porque se um mart quebrou o dado ja chegou errado na ponta.
+#
+# Os testes Elementary destes models bucketizam por horario de EXECUCAO, nao
+# por transaction_at: mart_average nao tem coluna de tempo e mart_top_vendas
+# tem apenas 3 linhas. Logo eles so acusam anomalia depois de acumular
+# historico de runs — ficam em warn.
+
+models:
+  - name: mart_top_vendas
+    description: >
+      As 3 maiores vendas entre as transacoes mais recentes de cada carteira
+      de destino (transaction_type = 'sale').
+    data_tests:
+      - elementary.schema_changes:
+          config:
+            tags: ["elementary", "dq"]
+            store_failures: false
+            severity: warn
+
+      # O model termina em LIMIT 3: se a contagem mudar, a logica mudou.
+      - dbt_expectations.expect_table_row_count_to_equal:
+          arguments:
+            value: 3
+          config:
+            severity: error
+
+    columns:
+      - name: receiving_address
+        description: Carteira de destino da venda.
+        data_tests:
+          - not_null
+          - unique   # ROW_NUMBER particiona por receiving_address: 1 linha cada
+
+      - name: amount
+        description: >
+          Valor da venda. Este not_null estava quebrando ate a correcao do
+          model: com ORDER BY amount DESC o Postgres ordena NULLS FIRST, entao
+          as 3 linhas do resultado eram as 3 vendas de valor desconhecido. O
+          model passou a filtrar amount IS NOT NULL antes de ranquear.
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+
+      - name: transaction_at
+        description: Momento da venda.
+        data_tests:
+          - not_null
+
+  - name: mart_average
+    description: >
+      Score de risco medio por regiao. Uma linha por location_region.
+    data_tests:
+      - elementary.schema_changes:
+          config:
+            tags: ["elementary", "dq"]
+            store_failures: false
+            severity: warn
+
+      - elementary.volume_anomalies:
+          config:
+            tags: ["elementary", "dq"]
+            store_failures: false
+            severity: warn
+
+      # 5 regioes reais. O placeholder '0' da origem vira 'unknown' na camada
+      # intermediaria e o model o exclui, entao ele nao conta aqui. A faixa
+      # fica larga de proposito: uma regiao nova na origem nao deve quebrar o
+      # pipeline, e sim aparecer no accepted_values do intermediate.
+      - dbt_expectations.expect_table_row_count_to_be_between:
+          arguments:
+            min_value: 1
+            max_value: 10
+          config:
+            severity: error
+
+    columns:
+      - name: location_region
+        description: Regiao geografica agregada.
+        data_tests:
+          - not_null
+          - unique   # o GROUP BY garante unicidade; o teste protege a garantia
+
+      - name: media_risk_score
+        description: >
+          Media do risk_score na regiao, arredondada em 2 casas. O model filtra
+          risk_score nulo, entao o resultado tem que ficar entre 0 e 100.
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 100
+                inclusive: true
+              config:
+                severity: error
+
+  - name: mart_dq_indicadores
+    description: >
+      Indicadores de qualidade do arquivo importado: quantidade de registros,
+      quantidade de erros e percentual de conformidade, por regra de qualidade.
+      Medido sobre a camada RAW — o dado como chegou do CSV, antes da limpeza.
+      Uma linha por regra, mais duas linhas consolidadas (com e sem o defeito
+      sistemico de formatacao).
+    data_tests:
+      - elementary.schema_changes:
+          config:
+            tags: ["elementary", "dq"]
+            store_failures: false
+            severity: warn
+
+      # Uma linha por regra + 2 consolidadas. Se o numero mudar sem alguem
+      # mexer no model, uma regra sumiu do calculo.
+      - dbt_expectations.expect_table_row_count_to_equal:
+          arguments:
+            value: 14
+          config:
+            severity: error
+
+    columns:
+      - name: regra
+        description: Regra de qualidade avaliada.
+        data_tests:
+          - not_null
+          - unique
+
+      - name: coluna
+        description: Coluna (ou combinacao) a que a regra se aplica.
+        data_tests:
+          - not_null
+
+      - name: tipo_defeito
+        description: >
+          Classificacao do defeito, nos termos do desafio: valor faltante,
+          valor inconsistente, valor incorreto, ou consolidado.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['valor faltante', 'valor inconsistente', 'valor incorreto', 'consolidado']
+              config:
+                severity: error
+
+      - name: qtd_registros
+        description: Total de registros importados (denominador dos percentuais).
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                inclusive: true
+              config:
+                severity: error
+
+      - name: qtd_erros
+        description: Registros que violam a regra.
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+              config:
+                severity: error
+
+      - name: pct_erro
+        description: qtd_erros / qtd_registros, em percentual.
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 100
+                inclusive: true
+              config:
+                severity: error
+
+      - name: pct_conformidade
+        description: >
+          (qtd_registros - qtd_erros) / qtd_registros, em percentual. E o
+          indicador pedido no desafio; complementar a pct_erro.
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 100
+                inclusive: true
+              config:
+                severity: error

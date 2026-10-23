@@ -1,0 +1,70 @@
+
+# Name your project! Project names should contain only lowercase characters
+# and underscores. A good package name should reflect your organization's
+# name or the intended use of these models
+name: 'fraud_credit'
+version: '1.0.0'
+
+# This setting configures which "profile" dbt uses for this project.
+profile: 'fraud_credit'
+
+# These configurations specify where dbt should look for different types of files.
+# The `model-paths` config, for example, states that models in this project can be
+# found in the "models/" directory. You probably won't need to change these!
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+clean-targets:         # directories to be removed by `dbt clean`
+  - "target"
+  - "dbt_packages"
+
+
+# Configuring models
+# Full documentation: https://docs.getdbt.com/docs/configuring-models
+
+# In this example config, we tell dbt to build all models in the example/
+# directory as views. These settings can be overridden in the individual model
+# files using the `{{ config(...) }}` macro.
+models:
+  fraud_credit:
+    # Config indicated by + and applies to all files under models/example/
+    marts:
+      +materialized: table
+    intermediate:
+      # view, nao ephemeral: model ephemeral nao vira objeto no banco, entao o
+      # Elementary nao consegue medir volume/distribuicao/schema dele. Como e a
+      # unica camada com transaction_at utilizavel, e onde a deteccao de
+      # anomalia tem material para trabalhar. Custo de virar view: zero.
+      +materialized: view
+    staging:
+      +materialized: view
+
+  # Modelos do pacote Elementary: vao para o schema "<target_schema>_elementary"
+  # (com target_schema = postgres -> postgres_elementary), que e o schema
+  # configurado no profile "elementary" usado pelo edr.
+  elementary:
+    +schema: "elementary"
+
+# Configuracao dos testes de dados (dbt >= 1.8 usa "data_tests", nao "tests").
+#
+# store_failures grava as linhas que falharam numa tabela em vez de so contar,
+# o que transforma "o teste quebrou" em "estas sao as 21 linhas com problema".
+# Elas vao para o schema <target_schema>_dq_failures, separado dos models.
+data_tests:
+  fraud_credit:
+    +store_failures: true
+    +schema: dq_failures
+
+# Os testes do pacote Elementary ficam de fora via "store_failures: false" no
+# config de cada um (ver os arquivos .yml dos models): eles pertencem ao
+# namespace "fraud_credit", nao ao "elementary", entao nao daria para
+# desliga-los por aqui.
+
+# Obrigatorio a partir do dbt 1.8: permite que o pacote Elementary sobrescreva
+# as materializacoes built-in e capture os resultados de run/test.
+flags:
+  require_explicit_package_overrides_for_builtin_materializations: false

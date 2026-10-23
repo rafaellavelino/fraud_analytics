@@ -1,0 +1,29 @@
+astro
+.git
+.env
+airflow_settings.yaml
+logs/
+.venv
+airflow.db
+airflow.cfg
+venv_dbt/
+.airflowignore
+
+# Estado de build do dbt, por AMBIENTE. Nunca deve entrar na imagem.
+#
+# O diretorio fraud_credit/ NAO e bind-mount (so dags/, plugins/, include/ e
+# tests/ sao), entao ele e copiado para a imagem no build. Sem estas duas
+# linhas, um "dbt run" local vaza o target/ para dentro da imagem — inclusive o
+# partial_parse.msgpack, que carrega o profile e o target com que foi gerado.
+#
+# Sintoma de quando isso acontece: no primeiro parse dentro do container o dbt
+# descarta o manifest herdado ("Unable to do partial parsing because profile has
+# changed") e, nessa transicao, a resolucao de namespace de pacote pode falhar
+# com erros do tipo "'dbt_expectations' is undefined" — em testes que compilam
+# normalmente no run seguinte.
+#
+# dbt_packages/ fica de FORA desta lista de proposito: o Dockerfile roda
+# "dbt deps" no build para popula-lo, e o Cosmos depende dele com
+# install_dbt_deps=False.
+fraud_credit/target/
+fraud_credit/logs/

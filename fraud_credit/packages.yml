@@ -1,0 +1,17 @@
+packages:
+  - package: elementary-data/elementary
+    version: 0.25.0  # Verifique a versão mais recente compatível
+  - package: dbt-labs/dbt_utils
+    version: 1.3.3
+  - package: metaplane/dbt_expectations
+    version: 0.10.10
+
+  # Dependencia TRANSITIVA do dbt_expectations, declarada aqui de proposito.
+  #
+  # O Cosmos monta o "dbt ls" do parse num diretorio temporario e exclui o
+  # package-lock.yml de proposito (ver create_symlinks em cosmos/dbt/project.py).
+  # Sem o lock, o dbt compara o numero de pacotes em packages.yml com o numero
+  # de pastas em dbt_packages e aborta com "expects 3 package(s) ... found 4".
+  # Declarando o dbt_date, as contas fecham em 4 nos dois lados.
+  - package: godatadriven/dbt_date
+    version: 0.21.0
